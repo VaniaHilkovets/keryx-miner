@@ -222,10 +222,11 @@ impl KeryxdHandler {
                         })
                     })
                 } else if !tx.inputs.is_empty() {
-                    // KRX:AI:1: JSON format used by the web wallet — defaults to TinyLlama.
+                    // KRX:AI:1: JSON format — model routed by "m" field, skipped if not loaded.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
-                        Self::parse_krx_ai_payload(&raw).map(|(prompt, max_tokens)| {
-                            (raw, keryx_miner::models::TINYLLAMA.model_id, prompt, max_tokens)
+                        Self::parse_krx_ai_payload(&raw).and_then(|(model_name, prompt, max_tokens)| {
+                            let model_id = keryx_miner::models::find(&model_name)?.model_id;
+                            Some((raw, model_id, prompt, max_tokens))
                         })
                     })
                 } else {
@@ -249,16 +250,17 @@ impl KeryxdHandler {
         }
     }
 
-    /// Parses a `KRX:AI:1:` JSON payload, returning `(prompt, max_tokens)`.
-    fn parse_krx_ai_payload(raw: &[u8]) -> Option<(String, usize)> {
+    /// Parses a `KRX:AI:1:` JSON payload, returning `(model_name, prompt, max_tokens)`.
+    fn parse_krx_ai_payload(raw: &[u8]) -> Option<(String, String, usize)> {
         const PREFIX: &[u8] = b"KRX:AI:1:";
         if raw.len() <= PREFIX.len() || !raw.starts_with(PREFIX) {
             return None;
         }
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
+        let model = v["m"].as_str().unwrap_or("tinyllama").to_string();
         let prompt = v["p"].as_str()?.to_string();
         let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
-        Some((prompt, max_tokens))
+        Some((model, prompt, max_tokens))
     }
 
     /// Starts SLM inference for the next queued AiRequest, if no inference is
