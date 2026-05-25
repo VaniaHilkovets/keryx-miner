@@ -25,16 +25,17 @@ const SIG_HASH_ALL: u8 = 0x01;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EscrowEntry {
+    /// TXID of the source transaction: coinbase txid for block rewards,
+    /// or AiRequest txid for inference escrow entries.
     pub coinbase_txid: String,
-    /// Block hash of the coinbase block — used to detect red-set exclusion via
-    /// mergeSetRedsHashes before even attempting a claim.
+    /// Block hash of the coinbase block — used to detect red-set exclusion.
+    /// Empty for inference escrow entries (non-coinbase TXs may be re-included).
     #[serde(default)]
     pub block_hash: String,
     pub confirm_daa: u64,
     pub amount_sompi: u64,
-    /// Index of the escrow output in the coinbase transaction.
-    /// Coinbases contain one escrow output per blue block in the mergeset, so
-    /// the index is NOT always 1 — it depends on fee outputs and mergeset size.
+    /// Index of the escrow output in the source transaction.
+    /// Coinbases: varies by mergeset size. Inference: always 1 (output[1]).
     #[serde(default = "default_output_index")]
     pub output_index: u32,
     pub claimed: bool,
@@ -43,10 +44,12 @@ pub struct EscrowEntry {
     pub orphan_slashed: bool,
     #[serde(default)]
     pub orphan_retries: u8,
-    /// Per-entry DAA cooldown after an orphan rejection. Other mature entries are
-    /// not blocked while this one waits — unlike the former global cooldown.
     #[serde(default)]
     pub orphan_retry_after_daa: Option<u64>,
+    /// True for AI inference escrow entries (from AiRequest output[1]).
+    /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
+    #[serde(default)]
+    pub is_inference: bool,
 }
 
 fn default_output_index() -> u32 {
@@ -149,7 +152,7 @@ impl EscrowWatcher {
             let mut dirty = false;
             for red_hash in &verbose.merge_set_reds_hashes {
                 if let Some(entry) = self.state.entries.iter_mut().find(|e| {
-                    !e.claimed && !e.slashed && !e.block_hash.is_empty() && &e.block_hash == red_hash
+                    !e.claimed && !e.slashed && !e.is_inference && !e.block_hash.is_empty() && &e.block_hash == red_hash
                 }) {
                     warn!(
                         "EscrowWatcher: block {} is red — permanently skipping coinbase={}…",
@@ -202,6 +205,7 @@ impl EscrowWatcher {
                         orphan_slashed: false,
                         orphan_retries: 0,
                         orphan_retry_after_daa: None,
+                        is_inference: false,
                     });
                     dirty = true;
                 }
@@ -385,6 +389,37 @@ impl EscrowWatcher {
             mass: 0,
             verbose_data: None,
         })
+    }
+
+    /// Record an AI inference escrow outpoint (AiRequest output[1]) to claim after the challenge window.
+    /// Called by grpc.rs after a successful AiResponse submission.
+    pub fn track_inference_escrow(&mut self, ai_request_txid: String, confirm_daa: u64, escrow_amount: u64) {
+        if escrow_amount == 0 {
+            return;
+        }
+        if self.state.entries.iter().any(|e| e.coinbase_txid == ai_request_txid && e.output_index == 1) {
+            return;
+        }
+        info!(
+            "EscrowWatcher: tracking inference escrow txid={}… daa={} amount={}",
+            &ai_request_txid[..16.min(ai_request_txid.len())],
+            confirm_daa,
+            escrow_amount,
+        );
+        self.state.entries.push(EscrowEntry {
+            coinbase_txid: ai_request_txid,
+            block_hash: String::new(),
+            confirm_daa,
+            amount_sompi: escrow_amount,
+            output_index: 1,
+            claimed: false,
+            slashed: false,
+            orphan_slashed: false,
+            orphan_retries: 0,
+            orphan_retry_after_daa: None,
+            is_inference: true,
+        });
+        self.save_state();
     }
 
     fn save_state(&self) {

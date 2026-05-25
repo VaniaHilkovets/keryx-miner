@@ -46,6 +46,10 @@ pub struct KeryxdHandler {
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
 
+    /// Maps stable_id → (txid, inference_reward_sompi) for confirmed AiRequest TXs.
+    /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
+    ai_request_txids: std::collections::HashMap<String, (String, u64)>,
+
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     inference_rx: Option<(Vec<u8>, oneshot::Receiver<String>)>,
 
@@ -142,6 +146,7 @@ impl KeryxdHandler {
             block_handle,
             ai_request_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
+            ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
             last_known_daa: 0,
             ipfs_url,
@@ -217,7 +222,8 @@ impl KeryxdHandler {
             txs.iter().map(|t| t.subnetwork_id.as_str()).collect::<Vec<_>>()
         );
         for tx in txs {
-            let extracted: Option<(Vec<u8>, [u8; 32], String, usize)> =
+            // (raw, model_id, prompt, max_tokens, inference_reward)
+            let extracted: Option<(Vec<u8>, [u8; 32], String, usize, u64)> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
                     // Binary AiRequestPayload (dedicated AI subnetwork).
                     hex::decode(&tx.payload).ok().and_then(|raw| {
@@ -225,7 +231,8 @@ impl KeryxdHandler {
                             let model_id = req.model_id;
                             let prompt = String::from_utf8_lossy(&req.prompt).into_owned();
                             let max_tokens = req.max_tokens as usize;
-                            (raw, model_id, prompt, max_tokens)
+                            let inference_reward = req.inference_reward;
+                            (raw, model_id, prompt, max_tokens, inference_reward)
                         })
                     })
                 } else if !tx.inputs.is_empty() {
@@ -233,14 +240,14 @@ impl KeryxdHandler {
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         Self::parse_krx_ai_payload(&raw).and_then(|(model_name, prompt, max_tokens)| {
                             let model_id = keryx_miner::models::find(&model_name)?.model_id;
-                            Some((raw, model_id, prompt, max_tokens))
+                            Some((raw, model_id, prompt, max_tokens, 0u64))
                         })
                     })
                 } else {
                     None // coinbase — skip
                 };
 
-            if let Some((raw, model_id, prompt, max_tokens)) = extracted {
+            if let Some((raw, model_id, prompt, max_tokens, inference_reward)) = extracted {
                 let loaded = keryx_miner::slm::loaded_model_ids();
                 if !loaded.contains(&model_id) {
                     log::debug!("OPoI: skipping AiRequest for unknown/unloaded model_id");
@@ -251,7 +258,16 @@ impl KeryxdHandler {
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id, raw, model_id, prompt, max_tokens));
+                    self.ai_request_queue.push_back((stable_id.clone(), raw, model_id, prompt, max_tokens));
+                }
+                // Track txid for escrow claims (only for confirmed TXs with a non-empty txid).
+                if inference_reward > 0 {
+                    if let Some(txid) = tx.verbose_data.as_ref()
+                        .map(|v| v.transaction_id.clone())
+                        .filter(|id| !id.is_empty())
+                    {
+                        self.ai_request_txids.insert(stable_id, (txid, inference_reward));
+                    }
                 }
             }
         }
@@ -331,6 +347,15 @@ impl KeryxdHandler {
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
             warn!("OPoI: failed to send AiResponse tx: {}", e);
         }
+
+        // Register inference escrow outpoint for auto-claim after the challenge window.
+        let stable_id = hex::encode(&full_hash.as_bytes()[..8]);
+        if let Some((txid, inference_reward)) = self.ai_request_txids.remove(&stable_id) {
+            if let Some(w) = self.escrow_watcher.as_mut() {
+                w.track_inference_escrow(txid, self.last_known_daa, inference_reward);
+            }
+        }
+
         true
     }
 

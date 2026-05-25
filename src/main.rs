@@ -210,6 +210,7 @@ async fn main() -> Result<(), Error> {
                 orphan_slashed: false,
                 orphan_retries: 0,
                 orphan_retry_after_daa: None,
+                is_inference: false,
             })
             .collect();
 
