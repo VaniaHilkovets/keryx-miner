@@ -554,7 +554,7 @@ impl KeryxdHandler {
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 32);
+                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64);
                                     let _ = tx_done.send(result);
                                 });
                                 self.challenge_inference_rx = Some((challenge, rx_done));
@@ -583,8 +583,9 @@ impl KeryxdHandler {
                     self.scan_txs_for_ai_requests(&block.transactions.clone());
                 }
                 self.try_start_inference();
-                // Pause GPU mining while inference is in flight (GPU is occupied by the model).
-                if self.inference_rx.is_some() {
+                // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
+                // This covers both regular AiRequest inference and node-issued challenge inference.
+                if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
                     miner.process_block(None).await?;
                     return Ok(());
                 }
