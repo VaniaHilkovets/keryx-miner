@@ -242,9 +242,13 @@ impl KeryxdHandler {
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
                 Ok(Some(text)) => {
-                    let model_id_hex = challenge_str.split(':').next().unwrap_or("");
+                    // challenge_str = "model_id_hex:nonce_hex"
+                    let mut parts = challenge_str.splitn(2, ':');
+                    let model_id_hex = parts.next().unwrap_or("");
+                    let nonce_hex_c  = parts.next().unwrap_or("");
                     info!("OPoI: sending challenge response model={:.8}", model_id_hex);
-                    format!("{}:{}", model_id_hex, text)
+                    // Response format: "model_id_hex:nonce_hex:result_text"
+                    format!("{}:{}:{}", model_id_hex, nonce_hex_c, text)
                 }
                 Ok(None) => {
                     warn!("OPoI: challenge inference failed — sending empty result, node will re-challenge");
