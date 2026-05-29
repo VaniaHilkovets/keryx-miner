@@ -367,7 +367,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     // R1 models spend tokens on chain-of-thought before the visible answer.
     // Reserve extra budget so the think block never eats the entire quota and
     // leaves no room for </think> + the actual response.
-    let think_overhead = if is_think_primed { 512usize } else { 0 };
+    // R1-32B reasons more extensively than 8B — give it more overhead to avoid
+    // the think block consuming all steps and producing an empty answer.
+    let think_overhead = if is_think_primed {
+        match engine.name {
+            "deepseek-r1-32b" => 1536,
+            _ => 512,
+        }
+    } else {
+        0
+    };
     let max_steps = max_new_tokens.saturating_add(think_overhead).min(model_max);
 
     match &mut engine.inner {
