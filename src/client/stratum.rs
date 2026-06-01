@@ -193,6 +193,25 @@ impl Client for StratumHandler {
                 error: None,
             })
             .await?;
+
+        // Declare loaded SLM models so the bridge can challenge with the right model.
+        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
+            .into_iter()
+            .map(|id| hex::encode(id))
+            .collect();
+        if !model_ids.is_empty() {
+            info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
+            self.send_channel
+                .send(StratumLine {
+                    id: None,
+                    payload: StratumLinePayload::StratumCommand(
+                        StratumCommand::MiningDeclareCapabilities(model_ids),
+                    ),
+                    jsonrpc: None,
+                    error: None,
+                })
+                .await?;
+        }
         Ok(())
     }
 

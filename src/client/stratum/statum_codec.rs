@@ -82,6 +82,9 @@ pub(crate) enum StratumCommand {
     Authorize((String, String)),
     #[serde(rename = "mining.submit")]
     MiningSubmit(MiningSubmit),
+    // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)
+    #[serde(rename = "mining.declare_capabilities")]
+    MiningDeclareCapabilities(Vec<String>),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
