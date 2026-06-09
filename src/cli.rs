@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + LLaMA-3.3-70B  — RTX 5090 (32GB+)", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + LLaMA-3.3-70B  — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + LLaMA-3.3-70B — RTX 5090 (32GB+)",
+        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + LLaMA-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high"]
     )]
@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "cpu-inference",
-        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light.",
+        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Required on AMD / non-NVIDIA GPUs, where inference cannot use CUDA (--cuda-disable only affects PoW, not inference). Pairs well with --light.",
         help_heading = "OPoI / Inference"
     )]
     pub cpu_inference: bool,
