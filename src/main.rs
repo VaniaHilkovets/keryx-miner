@@ -147,11 +147,12 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         _ => return,
     };
 
-    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
-    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
-    if needs_very_high && vram_mb < 30_000 {
+    // VRAM check for 70B: ~42.5 GB Q4_K_M weights + KV cache → requires a ≥46 GB card
+    // (48 GB single-GPU: RTX 6000 Ada / A6000 / L40S / RTX PRO 5000). A 32 GB card (RTX 5090)
+    // OOMs on this quant, so it is gated out here.
+    if needs_very_high && vram_mb < 46_000 {
         log::error!(
-            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent) — \
+            "✗  LLaMA-3.3-70B (Q4_K_M) requires ≥46 GB VRAM (48 GB card: RTX 6000 Ada / A6000 / RTX PRO 5000) — \
              this GPU has only {} MB ({} GB).",
             vram_mb,
             vram_mb / 1024
