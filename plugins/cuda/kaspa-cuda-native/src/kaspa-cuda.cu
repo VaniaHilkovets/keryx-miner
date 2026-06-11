@@ -1,6 +1,6 @@
 #include<stdint.h>
 #include <assert.h>
-#include "keccak-tiny.c"
+#include "keccak_asm.cuh"
 #include "xoshiro256starstar.c"
 
 
