@@ -185,6 +185,83 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
 
+/// Query VRAM via nvidia-smi: returns (gpu0_mb, sum_of_all_gpus_mb), or None
+/// when nvidia-smi is unavailable or unparseable (e.g. AMD-only machines).
+fn query_vram_mb() -> Option<(u64, u64)> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let mut gpu0 = None;
+    let mut total = 0u64;
+    for line in s.trim().lines() {
+        let v: u64 = line.trim().parse().ok()?;
+        if gpu0.is_none() {
+            gpu0 = Some(v);
+        }
+        total += v;
+    }
+    gpu0.map(|g| (g, total))
+}
+
+/// OPoI capability gate (layer A): drop the models this machine cannot actually
+/// serve, so the `ai:cap` announcement never promises a model the miner would
+/// fail to load — a 24 GB card running --very-high must announce 3 models, not 4.
+/// Pool-aware: with --vram-pool the summed VRAM only counts for llama-arch GGUF
+/// models (the only format the layer-split loader supports); every other format
+/// still has to fit on GPU 0. Skipped under --cpu-inference (no VRAM constraint)
+/// and when nvidia-smi is unavailable (CPU-fallback setups keep working).
+fn filter_specs_by_vram(
+    specs: &'static [&'static keryx_miner::models::ModelSpec],
+    vram_pool: bool,
+    cpu_inference: bool,
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    if cpu_inference {
+        return specs;
+    }
+    let Some((gpu0_mb, pooled_mb)) = query_vram_mb() else {
+        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        return specs;
+    };
+    let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
+        .iter()
+        .copied()
+        .filter(|spec| {
+            let splittable = vram_pool && spec.format == keryx_miner::models::ModelFormat::Gguf;
+            let available = if splittable { pooled_mb } else { gpu0_mb };
+            if spec.min_vram_mb <= available {
+                true
+            } else {
+                log::warn!(
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB available{} — model NOT announced (ai:cap) and not downloaded.{}",
+                    spec.name,
+                    spec.min_vram_mb,
+                    available,
+                    if splittable { " pooled" } else { " on GPU 0" },
+                    if !vram_pool && pooled_mb >= spec.min_vram_mb
+                        && spec.format == keryx_miner::models::ModelFormat::Gguf
+                    {
+                        " Your combined GPUs could serve it with --vram-pool."
+                    } else {
+                        ""
+                    }
+                );
+                false
+            }
+        })
+        .collect();
+    if kept.len() == specs.len() {
+        specs
+    } else {
+        // Leaked once at startup to keep the &'static API of init_supported.
+        Box::leak(kept.into_boxed_slice())
+    }
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -388,6 +465,9 @@ async fn main() -> Result<(), Error> {
     } else {
         &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
     };
+    // Layer-A OPoI capability gate: only announce (and download) what this
+    // hardware can actually serve.
+    let specs = filter_specs_by_vram(specs, opt.vram_pool, opt.cpu_inference);
     keryx_miner::slm::init_supported(specs);
     keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
     if opt.cpu_inference {

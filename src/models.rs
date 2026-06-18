@@ -26,6 +26,10 @@ pub struct ModelSpec {
     pub weight_cids: &'static [&'static str],
     /// Local directory name under `<exe_dir>/models/`.
     pub dir_name: &'static str,
+    /// Minimum VRAM (MB) required to actually serve this model: weights +
+    /// KV cache + CUDA workspace. Used by the OPoI capability gate so `ai:cap`
+    /// never announces a model the miner cannot load. 0 = never gated.
+    pub min_vram_mb: u64,
 }
 
 pub const TINYLLAMA: ModelSpec = ModelSpec {
@@ -42,6 +46,8 @@ pub const TINYLLAMA: ModelSpec = ModelSpec {
     config_cid: "QmbLTR3GLjBUKw8Lj14isiwG3XZJaL61ES852vkNqNPhyd",
     weight_cids: &["QmdqcmS8aMngiZWYYdeZEaW22N6XRTd9zK5ZCJG1MPmrQ3"],
     dir_name: "TinyLlama-1.1B",
+    // Baseline model — never gated. GPUs too small for it must use --cpu-inference.
+    min_vram_mb: 0,
 };
 
 pub const DEEPSEEK_R1_8B: ModelSpec = ModelSpec {
@@ -58,6 +64,8 @@ pub const DEEPSEEK_R1_8B: ModelSpec = ModelSpec {
     config_cid: "",
     weight_cids: &["QmYK1faUGNMYZ2UKeSpUoUoFpRarZQEwfPCHbYNG2ib2mR"],
     dir_name: "DeepSeek-R1-8B",
+    // ~4.9 GB Q4 weights + KV cache.
+    min_vram_mb: 5_500,
 };
 
 pub const DEEPSEEK_R1_32B: ModelSpec = ModelSpec {
@@ -74,6 +82,8 @@ pub const DEEPSEEK_R1_32B: ModelSpec = ModelSpec {
     config_cid: "",
     weight_cids: &["QmSrmkEoJUPf7r9t4o79F5APycnGrRu2icaU3KKPdFVUk7"],
     dir_name: "DeepSeek-R1-32B",
+    // ~19 GB Q4 weights + KV cache.
+    min_vram_mb: 20_000,
 };
 
 pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
@@ -90,6 +100,8 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     config_cid: "",
     weight_cids: &["QmbRQJFZ9NuZQW9uXezANTwunnwJCKybHiCFnVQ7D4SZKb"],
     dir_name: "Llama-3.3-70B",
+    // ~28 GB weights + KV cache (matches the --very-high 30 GB startup gate).
+    min_vram_mb: 30_000,
 };
 
 pub const REGISTRY: &[&ModelSpec] = &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &LLAMA_3_3_70B];
