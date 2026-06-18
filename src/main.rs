@@ -453,31 +453,36 @@ async fn main() -> Result<(), Error> {
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
 
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 4 models (Gemma-3-4B + Dolphin-8B + Qwen3-32B + LLaMA-70B).");
-        &[
-            &keryx_miner::models::GEMMA_3_4B,
-            &keryx_miner::models::DOLPHIN_LLAMA3_8B,
-            &keryx_miner::models::QWEN3_32B,
-            &keryx_miner::models::LLAMA_3_3_70B,
-        ]
+    let tier = if opt.very_high {
+        info!("--very-high mode: top tier (4 models).");
+        keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: loading Gemma-3-4B + Dolphin-8B + Qwen3-32B.");
-        &[
-            &keryx_miner::models::GEMMA_3_4B,
-            &keryx_miner::models::DOLPHIN_LLAMA3_8B,
-            &keryx_miner::models::QWEN3_32B,
-        ]
+        info!("--high mode: high tier (3 models).");
+        keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: loading Gemma-3-4B only.");
-        &[&keryx_miner::models::GEMMA_3_4B]
+        info!("--light mode: baseline tier (1 model).");
+        keryx_miner::models::Tier::Light
     } else {
-        &[&keryx_miner::models::GEMMA_3_4B, &keryx_miner::models::DOLPHIN_LLAMA3_8B]
+        keryx_miner::models::Tier::Default
     };
-    // Layer-A OPoI capability gate: only announce (and download) what this
-    // hardware can actually serve.
-    let specs = filter_specs_by_vram(specs, opt.vram_pool, opt.cpu_inference);
-    keryx_miner::slm::init_supported(specs);
+    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
+    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
+    // this hardware can serve (layer-A capability gate) — so the chain crossing
+    // hot-swaps without a restart:
+    //   - legacy (daa < H) is prefetched now and mined immediately;
+    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
+    let specs_v1 = filter_specs_by_vram(
+        keryx_miner::models::specs_for(0, tier),
+        opt.vram_pool,
+        opt.cpu_inference,
+    );
+    let specs_v2 = filter_specs_by_vram(
+        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+        opt.vram_pool,
+        opt.cpu_inference,
+    );
+    keryx_miner::slm::set_v2_lineup(specs_v2);
+    keryx_miner::slm::init_supported(specs_v1);
     keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
     if opt.cpu_inference {
         info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
@@ -486,10 +491,15 @@ async fn main() -> Result<(), Error> {
     if opt.vram_pool {
         info!("--vram-pool mode (EXPERIMENTAL): GGUF model layers split evenly across all CUDA devices.");
     }
-    info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
-    info!("Prefetching model files before mining starts…");
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
-        Ok(Ok(())) => info!("Model files ready — starting mining."),
+    info!(
+        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
+        specs_v1.len(),
+        specs_v2.len(),
+        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
+    );
+    info!("Prefetching legacy model files before mining starts…");
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
+        Ok(Ok(())) => info!("Legacy model files ready — starting mining."),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
             return Err(e.into());
@@ -499,6 +509,17 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
+    // Background-prefetch the uncensored lineup so the hardfork swap is gap-free.
+    tokio::task::spawn_blocking(move || {
+        info!("OPoI v2: background-prefetching the uncensored lineup ({} model(s))…", specs_v2.len());
+        match keryx_miner::slm::prefetch_models(specs_v2) {
+            Ok(()) => info!("OPoI v2: uncensored lineup ready — the hardfork swap will be instant."),
+            Err(e) => warn!(
+                "OPoI v2: background prefetch of the uncensored lineup failed: {} — will serve as files complete.",
+                e
+            ),
+        }
+    });
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     if opt.cpu_inference {
