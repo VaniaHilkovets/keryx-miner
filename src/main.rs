@@ -231,7 +231,13 @@ fn filter_specs_by_vram(
         .iter()
         .copied()
         .filter(|spec| {
-            let splittable = vram_pool && spec.format == keryx_miner::models::ModelFormat::Gguf;
+            let splittable = vram_pool
+                && matches!(
+                    spec.format,
+                    keryx_miner::models::ModelFormat::Gguf
+                        | keryx_miner::models::ModelFormat::GgufQwen2
+                        | keryx_miner::models::ModelFormat::GgufQwen3
+                );
             let available = if splittable { pooled_mb } else { gpu0_mb };
             if spec.min_vram_mb <= available {
                 true
@@ -243,7 +249,12 @@ fn filter_specs_by_vram(
                     available,
                     if splittable { " pooled" } else { " on GPU 0" },
                     if !vram_pool && pooled_mb >= spec.min_vram_mb
-                        && spec.format == keryx_miner::models::ModelFormat::Gguf
+                        && matches!(
+                            spec.format,
+                            keryx_miner::models::ModelFormat::Gguf
+                                | keryx_miner::models::ModelFormat::GgufQwen2
+                                | keryx_miner::models::ModelFormat::GgufQwen3
+                        )
                     {
                         " Your combined GPUs could serve it with --vram-pool."
                     } else {
