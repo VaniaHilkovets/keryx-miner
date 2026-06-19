@@ -284,7 +284,9 @@ impl MinerManager {
                     }
 
                     gpu_work.copy_output_to(&mut nonces)?;
-                    if nonces[0] != 0 {
+                    // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
+                    // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
+                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::POM_ACTIVATION_DAA {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
@@ -395,7 +397,13 @@ impl MinerManager {
                     };
                     nonce = (nonce & mask) | fixed;
 
-                    if let Some(block_seed) = state_ref.generate_block_if_pow(nonce.0) {
+                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
+                    let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
+                        keryx_miner::pom::active_index().and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, *tier))
+                    } else {
+                        state_ref.generate_block_if_pow(nonce.0)
+                    };
+                    if let Some(block_seed) = found {
                         match send_channel.blocking_send(block_seed.clone()) {
                             Ok(()) => block_seed.report_block(),
                             Err(e) => error!("Failed submitting block: ({})", e.to_string()),

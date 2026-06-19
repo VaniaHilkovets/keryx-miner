@@ -13,6 +13,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use candle_core::quantized::gguf_file;
 use candle_core::Device;
+use std::sync::OnceLock;
 
 pub const CHUNK_WORDS: usize = 4; // 32 B chunk
 const SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
@@ -424,6 +425,24 @@ impl WeightIndex {
         }
         path
     }
+}
+
+/// PoM possession activation DAA score — MUST match the node's `pom_activation`.
+/// `u64::MAX` = never (dormant): until flipped (with the §7 testnet), mining stays on
+/// legacy kHeavyHash and no possession proof is produced.
+pub const POM_ACTIVATION_DAA: u64 = u64::MAX;
+
+/// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
+static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
+
+/// Install the possession index (built from the resident model) and its tier. Call once.
+pub fn set_index(index: WeightIndex, tier: u8) {
+    let _ = POM_INDEX.set((index, tier));
+}
+
+/// The active possession index + tier, if installed.
+pub fn active_index() -> Option<&'static (WeightIndex, u8)> {
+    POM_INDEX.get()
 }
 
 #[cfg(test)]

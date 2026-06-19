@@ -71,6 +71,8 @@ pub struct State {
 
     pub nonce_mask: u64,
     pub nonce_fixed: u64,
+    /// Block DAA score — gates the PoM possession path (vs legacy kHeavyHash).
+    pub daa_score: u64,
 }
 
 impl State {
@@ -133,6 +135,7 @@ impl State {
             hasher,
             nonce_mask,
             nonce_fixed,
+            daa_score,
         })
     }
 
