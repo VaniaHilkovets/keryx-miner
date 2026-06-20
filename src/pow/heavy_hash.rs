@@ -25,7 +25,9 @@ pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 0;
 /// here (the CUDA kernel receives the precomputed matrix), so no kernel/PTX change is needed.
 ///
 /// Mainnet: 21_932_751 (same DAA as the old v3 gate; forks cleanly off the broken chain)
-pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 21_932_751;
+/// ⚠️ TESTNET value 0 — salt v4 from genesis to mirror live mainnet PoW. Revert to
+/// 21_932_751 before release. Must match the node's pow_salt_v4_activation.
+pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 0;
 
 /// Returns the active matrix-salt version (1, 2 or 4) for a block at `daa_score`.
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
