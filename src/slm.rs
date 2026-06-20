@@ -4,7 +4,7 @@
 /// consecutive requests for the same model. Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_core::quantized::gguf_file;
+use candle_core::quantized::{gguf_file, QTensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
@@ -17,7 +17,7 @@ use crate::quantized_qwen2_split::ModelWeights as Qwen2SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokenizers::Tokenizer;
 
 use crate::models::{ModelFormat, ModelSpec};
@@ -105,6 +105,22 @@ pub fn set_vram_pool(enabled: bool) {
 /// Whether layer-split VRAM pooling is enabled.
 pub fn vram_pool_enabled() -> bool {
     VRAM_POOL.load(AtomicOrdering::Relaxed)
+}
+
+/// When true, the mining-tier model is loaded via the layer-split loader even on a single GPU,
+/// so it lands as a `QuantizedQwen3Split` (etc.) that exposes `pom_quant_tensors()`. This lets
+/// the PoM walk share the inference weights in place (Option C2 zero-dup). Set at startup when
+/// PoM mining is configured. Single-device split == upstream behaviour (no cross-device moves).
+static POM_FORCE_SPLIT: AtomicBool = AtomicBool::new(false);
+
+/// Force the split loader for PoM zero-dup (see [`POM_FORCE_SPLIT`]). Call once at startup.
+pub fn set_pom_force_split(enabled: bool) {
+    POM_FORCE_SPLIT.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Whether the PoM zero-dup split loader is forced.
+pub fn pom_force_split() -> bool {
+    POM_FORCE_SPLIT.load(AtomicOrdering::Relaxed)
 }
 
 enum ModelInner {
@@ -629,6 +645,14 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                         .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
                     ModelInner::QuantizedQwen3(model)
                 }
+            } else if pom_force_split() && device.is_cuda() {
+                log::info!(
+                    "SlmEngine: PoM zero-dup — loading '{}' (Qwen3) via single-device split loader",
+                    spec.name
+                );
+                let model = Qwen3SplitWeights::from_gguf(content, &mut gguf_file, &[device.clone()])
+                    .map_err(|e| anyhow!("load qwen3 gguf weights (pom split): {}", e))?;
+                ModelInner::QuantizedQwen3Split(model)
             } else {
                 if vram_pool_enabled() && device.is_cuda() {
                     log::info!(
@@ -1134,6 +1158,9 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             if let Some(ref old) = *guard {
                 log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
             }
+            // Inference has priority over PoW: release the GPU miner's hold on the resident mining
+            // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
+            crate::pom_gpu::uninstall();
             *guard = None;
             let device = if cpu_inference_enabled() {
                 log::info!("SlmEngine: --cpu-inference set — running on CPU device");
@@ -1175,5 +1202,65 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             if let Ok(mut g) = ENGINE.lock() { *g = None; }
             None
         }
+    }
+}
+
+/// PoM C2: make `model_id` the resident engine model without running inference, so the possession
+/// walk can share its VRAM weights (one copy serves inference + walk). Returns true if resident.
+pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = match specs.iter().find(|s| &s.model_id == model_id) {
+        Some(s) => s,
+        None => return false,
+    };
+    let mut guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            let mut g = p.into_inner();
+            *g = None;
+            g
+        }
+    };
+    if guard.as_ref().map_or(false, |e| &e.model_id == model_id) {
+        return true; // already resident
+    }
+    *guard = None;
+    let device = if cpu_inference_enabled() {
+        Device::Cpu
+    } else {
+        match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — CPU fallback");
+                Device::Cpu
+            }
+        }
+    };
+    match load_engine(spec, device) {
+        Ok(e) => {
+            *guard = Some(e);
+            true
+        }
+        Err(e) => {
+            log::error!("SlmEngine: ensure_loaded '{}' failed: {}", spec.name, e);
+            false
+        }
+    }
+}
+
+/// PoM C2: if the resident engine model is `model_id` and a CUDA qwen3-split, return its device and
+/// quantized weight tensors (by canonical GGUF name) so the possession walk reads them in place
+/// instead of loading a second copy. None ⇒ caller falls back to a standalone `PomGpuMiner::load`.
+pub fn pom_shared(
+    model_id: &[u8; 32],
+) -> Option<(Device, std::collections::HashMap<String, Arc<QTensor>>)> {
+    let guard = ENGINE.lock().ok()?;
+    let e = guard.as_ref()?;
+    if &e.model_id != model_id || !e.device.is_cuda() {
+        return None;
+    }
+    match &e.inner {
+        ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        _ => None,
     }
 }

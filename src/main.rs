@@ -546,9 +546,11 @@ async fn main() -> Result<(), Error> {
         let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
         let path = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM: building possession index for tier {} ({}) — this can take a while…", tier, spec.dir_name);
+        let expected_n: u64;
         match tokio::task::spawn_blocking(move || keryx_miner::pom::WeightIndex::build_from_gguf(&path)).await {
             Ok(Ok(idx)) => {
                 info!("PoM: weight index ready — N={} chunks, R_T[..4]={:02x?}", idx.n_chunks, &idx.r_t[..4]);
+                expected_n = idx.n_chunks;
                 keryx_miner::pom::set_index(idx, tier);
             }
             Ok(Err(e)) => {
@@ -560,11 +562,36 @@ async fn main() -> Result<(), Error> {
                 return Err(e.into());
             }
         }
-        // Load the GPU miner: the same model resident in VRAM for the possession walk.
+        // Load the GPU miner. Option C2 zero-dup: make the inference engine load this tier
+        // resident (via the single-device split loader so it exposes its quant tensors), then
+        // have the possession walk share those VRAM buffers instead of a second copy. Falls back
+        // to a standalone load when the tier can't be shared (non-qwen3, CPU inference, etc.).
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
-        match tokio::task::spawn_blocking(move || keryx_miner::pom_gpu::PomGpuMiner::load(&gpath)).await {
+        let mining_id = spec.model_id;
+        match tokio::task::spawn_blocking(move || {
+            keryx_miner::slm::set_pom_force_split(true);
+            // Record the tier so the walk can be rebuilt after an inference swaps the model away.
+            keryx_miner::pom_gpu::set_mining_tier(mining_id, gpath.clone());
+            let _ = keryx_miner::slm::ensure_loaded(&mining_id);
+            if let Some((device, shared)) = keryx_miner::slm::pom_shared(&mining_id) {
+                log::info!("PoM: zero-dup — sharing {} resident inference tensors for the walk", shared.len());
+                keryx_miner::pom_gpu::PomGpuMiner::load_shared(&gpath, &device, &shared)
+            } else {
+                log::info!("PoM: tier not shareable — loading a standalone possession copy");
+                keryx_miner::pom_gpu::PomGpuMiner::load(&gpath)
+            }
+        })
+        .await
+        {
             Ok(Ok(gm)) => {
-                info!("PoM: GPU miner ready — N={} chunks resident", gm.n_chunks());
+                if gm.n_chunks() != expected_n {
+                    error!(
+                        "PoM: gather N={} != index N={} — shared/raw layout mismatch; refusing to mine (would produce rejected blocks)",
+                        gm.n_chunks(), expected_n
+                    );
+                    return Err(format!("PoM gather N mismatch: {} != {}", gm.n_chunks(), expected_n).into());
+                }
+                info!("PoM: GPU miner ready — N={} chunks resident (matches index)", gm.n_chunks());
                 keryx_miner::pom_gpu::install(gm);
             }
             Ok(Err(e)) => {

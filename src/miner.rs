@@ -287,6 +287,11 @@ impl MinerManager {
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
                             (pph, time, s.target.to_le_bytes())
                         };
+                        // An inference may have evicted the mining model (inference has priority).
+                        // Rebuild the walk (reloads the model resident) before mining resumes.
+                        if !keryx_miner::pom_gpu::is_installed() {
+                            keryx_miner::pom_gpu::ensure_installed();
+                        }
                         let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
