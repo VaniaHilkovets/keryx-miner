@@ -265,7 +265,7 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
 
     // .ok sentinel written only after a complete download — guards against truncated files
     if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) && ok_flag.exists() {
-        log::info!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
+        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, cfg, wts));
     }
     std::fs::create_dir_all(&dir)?;
@@ -290,7 +290,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
     // .ok sentinel written only after a complete download — guards against truncated files
     if tok.exists() && gguf.exists() && ok_flag.exists() {
-        log::info!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
+        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
     std::fs::create_dir_all(&dir)?;
@@ -834,12 +834,17 @@ pub fn evict_engine() {
     }
 }
 
+/// True once we have observed a pre-H DAA in this process, i.e. we are genuinely crossing
+/// the hardfork live (vs. starting up already past H, where nothing is "swapped").
+static SEEN_PRE_H: AtomicBool = AtomicBool::new(false);
+
 /// At the `OPOI_V2_ACTIVATION_DAA` crossing, swap the served lineup from the legacy
 /// set to the (pre-staged, background-prefetched) uncensored set — without a restart.
 /// PoW never stops; `ai:cap` follows `loaded_model_ids()` as the v2 files land.
 /// Idempotent and cheap to call on every block template.
 pub fn advance_lineup_if_due(daa: u64) {
     if daa < crate::models::OPOI_V2_ACTIVATION_DAA {
+        SEEN_PRE_H.store(true, AtomicOrdering::SeqCst);
         return;
     }
     if V2_ACTIVE.load(AtomicOrdering::SeqCst) {
@@ -856,11 +861,21 @@ pub fn advance_lineup_if_due(daa: u64) {
     if V2_ACTIVE.swap(true, AtomicOrdering::SeqCst) {
         return; // lost the race — another caller already swapped
     }
-    log::info!(
-        "=== OPoI v2 HARDFORK reached at DAA {} — hot-swapping to the uncensored lineup ({} model(s)) ===",
-        daa,
-        v2.len()
-    );
+    if SEEN_PRE_H.load(AtomicOrdering::SeqCst) {
+        // Genuine live crossing: the chain advanced past H while we were running.
+        log::info!(
+            "=== OPoI v2 HARDFORK reached at DAA {} — hot-swapping to the uncensored lineup ({} model(s)) ===",
+            daa,
+            v2.len()
+        );
+    } else {
+        // Started up already past H — nothing is "swapped", we just serve the uncensored lineup.
+        log::info!(
+            "OPoI v2 already active (DAA {} ≥ H) — serving the uncensored lineup ({} model(s)).",
+            daa,
+            v2.len()
+        );
+    }
     *SUPPORTED_SPECS.write().unwrap() = v2;
     evict_engine();
 }
@@ -928,13 +943,13 @@ pub fn probe_gpu_inference() -> GpuProbe {
 /// Returns Err if any model fails to download; mining must not start in that case.
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
-        log::info!("SlmEngine: prefetching model '{}'…", spec.name);
+        log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
             ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3 => ensure_gguf(spec).map(|_| ()),
         };
         match result {
-            Ok(()) => log::info!("SlmEngine: '{}' files ready.", spec.name),
+            Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
             Err(e) => {
                 log::error!("SlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
                 return Err(e);

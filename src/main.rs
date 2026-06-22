@@ -458,7 +458,7 @@ async fn main() -> Result<(), Error> {
     };
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v1);
-    info!(
+    log::debug!(
         "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
         specs_v1.len(),
         specs_v2.len(),
@@ -467,9 +467,8 @@ async fn main() -> Result<(), Error> {
     // Block on BOTH lineups before mining: never start hashing while a model this miner
     // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
     // still downloading. The readiness-gated swap then activates v2 instantly at H.
-    info!("Prefetching all model files (legacy + uncensored) before mining starts…");
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-        Ok(Ok(())) => info!("Legacy model files ready."),
+        Ok(Ok(())) => log::debug!("Legacy model files ready."),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
             return Err(e.into());
@@ -480,7 +479,7 @@ async fn main() -> Result<(), Error> {
         }
     }
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
-        Ok(Ok(())) => info!("Uncensored model files ready — starting mining."),
+        Ok(Ok(())) => info!("Model files ready — starting mining."),
         Ok(Err(e)) => {
             error!("OPoI v2 prefetch failed — refusing to mine without the post-hardfork lineup: {}", e);
             return Err(e.into());
