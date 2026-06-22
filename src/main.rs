@@ -159,30 +159,31 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
         _ => return,
     };
 
-    // VRAM check for 70B: ~42.5 GB Q4_K_M weights + ~3.5 GB KV cache → requires a
-    // ≥48 GB card. On smaller single GPUs, loading will OOM — pool with --vram-pool.
-    if needs_very_high && vram_mb < 46_000 {
-        log::error!(
-            "✗  Llama-3.3-70B (Q4_K_M) requires ≥48 GB VRAM (RTX 6000 Ada / A6000 / L40S, \
-             or multiple GPUs pooled with --vram-pool) — only {} MB ({} GB) {}.",
-            vram_mb,
+    // VRAM sufficiency for the selected tier (Q4_K_M weights + KV cache + CUDA workspace).
+    // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
+    // host/CPU or pooled path can still serve it — so warn rather than error, and do NOT then
+    // claim the model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
+    let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
+        ("Llama-3.3-70B (--very-high)", 46_000)
+    } else if needs_high {
+        ("Qwen3-32B (--high)", 20_000)
+    } else {
+        ("Dolphin-8B (default)", 8_000)
+    };
+
+    if vram_mb < min_vram_mb {
+        log::warn!(
+            "⚠  {} needs ≥{} GB VRAM but only {} GB {} — GPU inference for this tier will OOM. \
+             Use a smaller tier (--high Qwen3-32B / --light Gemma-3-4B), pool with --vram-pool, \
+             or serve it via a host/CPU path.",
+            model_label,
+            min_vram_mb / 1024,
             vram_mb / 1024,
             if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
         );
-        log::error!(
-            "   Use --high (Qwen3-32B, fits in 24 GB) or --light (Gemma-3-4B only)."
-        );
-        // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
-    }
-
-    let model_label = if needs_very_high {
-        "Llama-3.3-70B (--very-high)"
-    } else if needs_high {
-        "Qwen3-32B (--high)"
     } else {
-        "Dolphin-8B (default)"
-    };
-    log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+        log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+    }
 }
 
 /// Query VRAM via nvidia-smi: returns (gpu0_mb, sum_of_all_gpus_mb), or None
@@ -443,26 +444,29 @@ async fn main() -> Result<(), Error> {
         }
     };
 
-    // Phase-3 OPoI: load inference models before mining starts.
-    //   (no flag)    → Gemma-3-4B + Dolphin-8B  [default]
-    //   --light      → Gemma-3-4B only
-    //   --high       → Gemma-3-4B + Dolphin-8B + Qwen3-32B
-    //   --very-high  → all 4 models (+ Llama-3.3-70B)
+    // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
+    // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
+    // property, not a per-GPU one.
+    //   (no flag)    → Dolphin-8B   [default]
+    //   --light      → Gemma-3-4B
+    //   --high       → Qwen3-32B
+    //   --very-high  → Llama-3.3-70B
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
 
     let tier = if opt.very_high {
-        info!("--very-high mode: top tier (4 models).");
+        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier (3 models).");
+        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: baseline tier (1 model).");
+        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         keryx_miner::models::Tier::Light
     } else {
+        info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
     // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's

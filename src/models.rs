@@ -228,11 +228,16 @@ pub enum Tier {
 /// so miners can upgrade before the hardfork without a flag-day restart.
 pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
     if daa >= OPOI_V2_ACTIVATION_DAA {
+        // PoM era: one flag = one model. Each hardware tier mines AND serves exactly the
+        // single model it proves possession of — the cumulative "serve everything below my
+        // tier" behaviour is dropped, because a PoM GPU is bound to its tier (serving a
+        // lower tier means unloading the mined model and pausing mining). Multi-tier
+        // coverage is a network property (different miners per tier), not a per-GPU one.
         match tier {
             Tier::Light => &[&GEMMA_3_4B],
-            Tier::Default => &[&GEMMA_3_4B, &DOLPHIN_LLAMA3_8B],
-            Tier::High => &[&GEMMA_3_4B, &DOLPHIN_LLAMA3_8B, &QWEN3_32B],
-            Tier::VeryHigh => &[&GEMMA_3_4B, &DOLPHIN_LLAMA3_8B, &QWEN3_32B, &LLAMA_3_3_70B],
+            Tier::Default => &[&DOLPHIN_LLAMA3_8B],
+            Tier::High => &[&QWEN3_32B],
+            Tier::VeryHigh => &[&LLAMA_3_3_70B],
         }
     } else {
         match tier {
