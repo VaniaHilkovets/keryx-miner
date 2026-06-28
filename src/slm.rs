@@ -1027,8 +1027,14 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 None
             }
             Err(e) => {
-                log::warn!("SlmEngine '{}' generate error: {}", engine.name, e);
-                Some(format!("[inference error: {}]", e))
+                // A failed generation must NOT be submitted as an OPoI response: the miner would
+                // otherwise be rewarded for garbage (the "[inference error: ...]" string used to
+                // pass validation). Drop the response and evict the engine so a clean one reloads
+                // on the next request — the error may have left the CUDA/candle context wedged.
+                let name = engine.name;
+                log::warn!("SlmEngine '{}' generate error: {} — response dropped, engine evicted", name, e);
+                *guard = None;
+                None
             }
         }
     });
