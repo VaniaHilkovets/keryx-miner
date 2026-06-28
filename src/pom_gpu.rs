@@ -9,6 +9,8 @@
 //! The kernel's seed/pow folds are byte-identical to `pom::pom_block_seed`/`pom::pom_pow_value`,
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use log::info;
@@ -40,9 +42,10 @@ pub struct PomGpuMiner {
 }
 
 impl PomGpuMiner {
-    /// Load the mining model's GGUF into candle (device 0), build the gather index, load the kernel.
-    pub fn load(gguf_path: &str) -> candle_core::Result<Self> {
-        let device = Device::new_cuda(0)?;
+    /// Load the mining model's GGUF into candle on a specific CUDA device, build the gather
+    /// index, load the kernel.
+    pub fn load(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
+        let device = Device::new_cuda(device_id)?;
         let cuda = match &device {
             Device::Cuda(c) => c.clone(),
             _ => return Err(candle_core::Error::Msg("PoM GPU: not a CUDA device".into())),
@@ -174,44 +177,53 @@ impl PomGpuMiner {
     }
 }
 
-// The GPU miner instance. Option (not OnceLock) so it can be uninstalled to free VRAM when an
-// inference for another model needs the GPU (inference has priority over PoW), then reinstalled
-// when mining resumes.
-static MINER: Mutex<Option<PomGpuMiner>> = Mutex::new(None);
+// Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
+// is duplicated per device. This avoids all workers contending over a single GPU0-bound miner.
+fn miners() -> &'static Mutex<HashMap<u32, PomGpuMiner>> {
+    static MINERS: OnceLock<Mutex<HashMap<u32, PomGpuMiner>>> = OnceLock::new();
+    MINERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
-/// Install the GPU miner (after loading/sharing the mining model's resident weights).
-pub fn install(m: PomGpuMiner) {
-    if let Ok(mut g) = MINER.lock() {
-        *g = Some(m);
+// Guards the one-time shared host index build. All workers may race into PoM activation, but the
+// heavy GGUF -> WeightIndex build must happen exactly once for the process.
+fn index_build_lock() -> &'static Mutex<()> {
+    static INDEX_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Install the GPU miner for a specific CUDA device.
+pub fn install(device_id: u32, m: PomGpuMiner) {
+    if let Ok(mut g) = miners().lock() {
+        g.insert(device_id, m);
     }
 }
 
 /// Drop the GPU miner, releasing its hold on the mining model's VRAM (shared Arcs + gather) so
 /// the inference engine can load another model. Mining is paused during inference anyway.
 pub fn uninstall() {
-    if let Ok(mut g) = MINER.lock() {
-        *g = None;
+    if let Ok(mut g) = miners().lock() {
+        g.clear();
     }
 }
 
-/// Whether the GPU miner is currently installed.
-pub fn is_installed() -> bool {
-    MINER.lock().map(|g| g.is_some()).unwrap_or(false)
+/// Whether the GPU miner is currently installed for `device_id`.
+pub fn is_installed(device_id: u32) -> bool {
+    miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
 /// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
-static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOADING: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether a PoM model load/rebuild is in progress (worker intentionally paused, not stalled).
 pub fn is_loading() -> bool {
-    LOADING.load(std::sync::atomic::Ordering::Relaxed)
+    LOADING.load(Ordering::Relaxed) > 0
 }
 
-/// Convenience: search a nonce batch via the installed miner. None if not installed or no winner.
-pub fn mine(pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
-    let g = MINER.lock().ok()?;
-    g.as_ref()?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+/// Convenience: search a nonce batch via the installed miner for a specific device.
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+    let g = miners().lock().ok()?;
+    g.get(&device_id)?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
@@ -226,18 +238,18 @@ pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
-pub fn ensure_installed() -> bool {
-    if is_installed() {
+pub fn ensure_installed(device_id: u32) -> bool {
+    if is_installed(device_id) {
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
-    LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let ok = ensure_installed_inner();
-    LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    LOADING.fetch_add(1, Ordering::Relaxed);
+    let ok = ensure_installed_inner(device_id);
+    LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner() -> bool {
+fn ensure_installed_inner(device_id: u32) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
@@ -245,47 +257,47 @@ fn ensure_installed_inner() -> bool {
     // Build the possession index once (host, heavy) the first time PoM activates — deferred from
     // boot so the pre-PoM legacy phase starts immediately and keeps host/GPU free.
     if crate::pom::active_index().is_none() {
-        let tier = match crate::models::pom_tier_index(model_id) {
-            Some(t) => t,
-            None => return false,
+        let _guard = match index_build_lock().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         };
-        info!("PoM: building possession index (first PoM activation) — this can take a while…");
-        match crate::pom::WeightIndex::build_from_gguf(gguf) {
-            Ok(idx) => {
-                info!("PoM: weight index ready — N={} chunks", idx.n_chunks);
-                crate::pom::set_index(idx, tier);
-            }
-            Err(e) => {
-                log::error!("PoM: index build failed: {}", e);
-                return false;
+        if crate::pom::active_index().is_none() {
+            let tier = match crate::models::pom_tier_index(model_id) {
+                Some(t) => t,
+                None => return false,
+            };
+            info!("PoM: building shared host weight index (gpu{}) — this can take a while…", device_id);
+            match crate::pom::WeightIndex::build_from_gguf(gguf) {
+                Ok(idx) => {
+                    info!("PoM: shared host index ready — N={} chunks", idx.n_chunks);
+                    crate::pom::set_index(idx, tier);
+                }
+                Err(e) => {
+                    log::error!("PoM: shared host index build failed on gpu{}: {}", device_id, e);
+                    return false;
+                }
             }
         }
     }
-    // Make the mining model resident again (evicts whatever inference loaded), then share it.
-    if !crate::slm::ensure_loaded(model_id) {
-        return false;
-    }
-    let m = if let Some((device, shared)) = crate::slm::pom_shared(model_id) {
-        PomGpuMiner::load_shared(gguf, &device, &shared)
-    } else {
-        PomGpuMiner::load(gguf)
-    };
+    // One CUDA-resident PoM worker per GPU. This avoids all workers contending for a single
+    // GPU0-bound miner object while still sharing the host-side index across the process.
+    let m = PomGpuMiner::load(gguf, device_id as usize);
     match m {
         Ok(gm) => {
             let n = gm.n_chunks();
             // N-guard: the gather must match the host index, else blocks would be rejected.
             if let Some((idx, _)) = crate::pom::active_index() {
                 if n != idx.n_chunks {
-                    log::error!("PoM: gather N={} != index N={} — refusing to mine (rejected blocks)", n, idx.n_chunks);
+                    log::error!("PoM[gpu{}]: gather N={} != shared index N={} — refusing to mine", device_id, n, idx.n_chunks);
                     return false;
                 }
             }
-            install(gm);
-            info!("PoM: GPU miner ready — N={} chunks resident (matches index)", n);
+            install(device_id, gm);
+            info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
             true
         }
         Err(e) => {
-            log::error!("PoM: rebuild failed: {}", e);
+            log::error!("PoM[gpu{}]: device miner build failed: {}", device_id, e);
             false
         }
     }
